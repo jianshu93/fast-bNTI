@@ -1,6 +1,6 @@
-# betanti
+# Fast $\beta$NTI computation at large scale
 
-Fast exact betaNTI at scale for microbial communities.
+Fast exact $\beta$NTI at scale for microbial communities.
 
 `betanti` reads a dense text table by default, or a BIOM HDF5 table with `--biom`, plus a rooted Newick tree. It computes observed abundance-weighted betaMNTD, then computes betaNTI using taxa-label permutations without writing permutation matrices to disk.
 
