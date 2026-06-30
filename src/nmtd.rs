@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     fs::File,
     io::{BufWriter, Write},
     path::Path,
@@ -15,8 +16,298 @@ use crate::{
 
 const INF: f32 = f32::INFINITY;
 
+thread_local! {
+    static DIST_SCRATCH: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
+
 pub struct BetaOptions {
     pub block_size: usize,
+}
+
+#[derive(Copy, Clone, Debug)]
+enum SimdBackend {
+    Scalar,
+    #[cfg(target_arch = "aarch64")]
+    Neon,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    Avx2,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    Avx512,
+}
+
+impl SimdBackend {
+    fn detect_dot(width: usize) -> Self {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if width >= 8 && std::arch::is_x86_feature_detected!("avx512f") {
+                return Self::Avx512;
+            }
+            if width >= 4 && std::arch::is_x86_feature_detected!("avx2") {
+                return Self::Avx2;
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if width >= 2 {
+                return Self::Neon;
+            }
+        }
+
+        #[allow(unreachable_code)]
+        Self::Scalar
+    }
+
+    fn detect_tree(width: usize) -> Self {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if width >= 16 && std::arch::is_x86_feature_detected!("avx512f") {
+                return Self::Avx512;
+            }
+            if width >= 8 && std::arch::is_x86_feature_detected!("avx2") {
+                return Self::Avx2;
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if width >= 4 {
+                return Self::Neon;
+            }
+        }
+
+        #[allow(unreachable_code)]
+        Self::Scalar
+    }
+
+    #[inline(always)]
+    fn accumulate(self, row: &mut [f64], dist: &[f32], weight: f64) {
+        debug_assert_eq!(row.len(), dist.len());
+        match self {
+            Self::Scalar => accumulate_weighted_dist_scalar(row, dist, weight),
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => accumulate_weighted_dist_neon(row, dist, weight),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Self::Avx2 => unsafe { accumulate_weighted_dist_avx2(row, dist, weight) },
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Self::Avx512 => unsafe { accumulate_weighted_dist_avx512(row, dist, weight) },
+        }
+    }
+
+    #[inline(always)]
+    fn relax_min(self, dst: &mut [f32], src: &[f32], edge: f32) {
+        debug_assert_eq!(dst.len(), src.len());
+        match self {
+            Self::Scalar => relax_min_scalar(dst, src, edge),
+            #[cfg(target_arch = "aarch64")]
+            Self::Neon => relax_min_neon(dst, src, edge),
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Self::Avx2 => unsafe { relax_min_avx2(dst, src, edge) },
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            Self::Avx512 => unsafe { relax_min_avx512(dst, src, edge) },
+        }
+    }
+}
+
+#[inline(always)]
+fn accumulate_weighted_dist_scalar(row: &mut [f64], dist: &[f32], weight: f64) {
+    for (acc, &d) in row.iter_mut().zip(dist.iter()) {
+        *acc += weight * d as f64;
+    }
+}
+
+#[inline(always)]
+fn relax_min_block(
+    backend: SimdBackend,
+    dist: &mut [f32],
+    dst_base: usize,
+    src_base: usize,
+    width: usize,
+    edge: f32,
+) {
+    debug_assert_ne!(dst_base, src_base);
+    debug_assert!(dst_base + width <= dist.len());
+    debug_assert!(src_base + width <= dist.len());
+
+    if dst_base < src_base {
+        let (left, right) = dist.split_at_mut(src_base);
+        let dst = &mut left[dst_base..dst_base + width];
+        let src = &right[..width];
+        backend.relax_min(dst, src, edge);
+    } else {
+        let (left, right) = dist.split_at_mut(dst_base);
+        let src = &left[src_base..src_base + width];
+        let dst = &mut right[..width];
+        backend.relax_min(dst, src, edge);
+    }
+}
+
+#[inline(always)]
+fn relax_min_scalar(dst: &mut [f32], src: &[f32], edge: f32) {
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        let candidate = s + edge;
+        if candidate < *d {
+            *d = candidate;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn relax_min_neon(dst: &mut [f32], src: &[f32], edge: f32) {
+    use core::arch::aarch64::*;
+
+    let mut k = 0usize;
+    let width = dst.len();
+    unsafe {
+        let dst_ptr = dst.as_mut_ptr();
+        let src_ptr = src.as_ptr();
+        let edge_v = vdupq_n_f32(edge);
+        while k + 4 <= width {
+            let src_v = vld1q_f32(src_ptr.add(k));
+            let dst_v = vld1q_f32(dst_ptr.add(k));
+            let candidate = vaddq_f32(src_v, edge_v);
+            vst1q_f32(dst_ptr.add(k), vminq_f32(dst_v, candidate));
+            k += 4;
+        }
+    }
+    if k < width {
+        relax_min_scalar(&mut dst[k..], &src[k..], edge);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn relax_min_avx2(dst: &mut [f32], src: &[f32], edge: f32) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let mut k = 0usize;
+    let width = dst.len();
+    let edge_v = _mm256_set1_ps(edge);
+    unsafe {
+        let dst_ptr = dst.as_mut_ptr();
+        let src_ptr = src.as_ptr();
+        while k + 8 <= width {
+            let src_v = _mm256_loadu_ps(src_ptr.add(k));
+            let dst_v = _mm256_loadu_ps(dst_ptr.add(k));
+            let candidate = _mm256_add_ps(src_v, edge_v);
+            _mm256_storeu_ps(dst_ptr.add(k), _mm256_min_ps(dst_v, candidate));
+            k += 8;
+        }
+    }
+    if k < width {
+        relax_min_scalar(&mut dst[k..], &src[k..], edge);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn relax_min_avx512(dst: &mut [f32], src: &[f32], edge: f32) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let mut k = 0usize;
+    let width = dst.len();
+    let edge_v = _mm512_set1_ps(edge);
+    unsafe {
+        let dst_ptr = dst.as_mut_ptr();
+        let src_ptr = src.as_ptr();
+        while k + 16 <= width {
+            let src_v = _mm512_loadu_ps(src_ptr.add(k));
+            let dst_v = _mm512_loadu_ps(dst_ptr.add(k));
+            let candidate = _mm512_add_ps(src_v, edge_v);
+            _mm512_storeu_ps(dst_ptr.add(k), _mm512_min_ps(dst_v, candidate));
+            k += 16;
+        }
+    }
+    if k < width {
+        relax_min_scalar(&mut dst[k..], &src[k..], edge);
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn accumulate_weighted_dist_neon(row: &mut [f64], dist: &[f32], weight: f64) {
+    use core::arch::aarch64::*;
+
+    let mut k = 0usize;
+    let width = row.len();
+    unsafe {
+        let row_ptr = row.as_mut_ptr();
+        let dist_ptr = dist.as_ptr();
+        while k + 2 <= width {
+            let d32 = vld1_f32(dist_ptr.add(k));
+            let d64 = vcvt_f64_f32(d32);
+            let acc = vld1q_f64(row_ptr.add(k));
+            let next = vaddq_f64(acc, vmulq_n_f64(d64, weight));
+            vst1q_f64(row_ptr.add(k), next);
+            k += 2;
+        }
+    }
+    if k < width {
+        accumulate_weighted_dist_scalar(&mut row[k..], &dist[k..], weight);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn accumulate_weighted_dist_avx2(row: &mut [f64], dist: &[f32], weight: f64) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let mut k = 0usize;
+    let width = row.len();
+    let w = _mm256_set1_pd(weight);
+    unsafe {
+        let row_ptr = row.as_mut_ptr();
+        let dist_ptr = dist.as_ptr();
+        while k + 4 <= width {
+            let d32 = _mm_loadu_ps(dist_ptr.add(k));
+            let d64 = _mm256_cvtps_pd(d32);
+            let acc = _mm256_loadu_pd(row_ptr.add(k));
+            let next = _mm256_add_pd(acc, _mm256_mul_pd(w, d64));
+            _mm256_storeu_pd(row_ptr.add(k), next);
+            k += 4;
+        }
+    }
+    if k < width {
+        accumulate_weighted_dist_scalar(&mut row[k..], &dist[k..], weight);
+    }
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx512f")]
+unsafe fn accumulate_weighted_dist_avx512(row: &mut [f64], dist: &[f32], weight: f64) {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::*;
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::*;
+
+    let mut k = 0usize;
+    let width = row.len();
+    let w = _mm512_set1_pd(weight);
+    unsafe {
+        let row_ptr = row.as_mut_ptr();
+        let dist_ptr = dist.as_ptr();
+        while k + 8 <= width {
+            let d32 = _mm256_loadu_ps(dist_ptr.add(k));
+            let d64 = _mm512_cvtps_pd(d32);
+            let acc = _mm512_loadu_pd(row_ptr.add(k));
+            let next = _mm512_add_pd(acc, _mm512_mul_pd(w, d64));
+            _mm512_storeu_pd(row_ptr.add(k), next);
+            k += 8;
+        }
+    }
+    if k < width {
+        accumulate_weighted_dist_scalar(&mut row[k..], &dist[k..], weight);
+    }
 }
 
 pub fn compute_pair_values(
@@ -81,7 +372,9 @@ fn compute_target_block_simple(
     width: usize,
 ) -> Vec<f64> {
     let node_count = tree.node_count();
-    let mut dist = vec![INF; node_count * width];
+    let dot_backend = SimdBackend::detect_dot(width);
+    let tree_backend = SimdBackend::detect_tree(width);
+    let mut dist = take_dist_scratch(node_count * width);
 
     for k in 0..width {
         let target = &samples[start + k];
@@ -99,12 +392,14 @@ fn compute_target_block_simple(
         let edge = tree.branch_length[node];
         let child_base = node * width;
         let parent_base = parent * width;
-        for k in 0..width {
-            let candidate = dist[child_base + k] + edge;
-            if candidate < dist[parent_base + k] {
-                dist[parent_base + k] = candidate;
-            }
-        }
+        relax_min_block(
+            tree_backend,
+            &mut dist,
+            parent_base,
+            child_base,
+            width,
+            edge,
+        );
     }
 
     for &node in &tree.preorder {
@@ -115,12 +410,7 @@ fn compute_target_block_simple(
         let edge = tree.branch_length[node];
         let node_base = node * width;
         let parent_base = parent * width;
-        for k in 0..width {
-            let candidate = dist[parent_base + k] + edge;
-            if candidate < dist[node_base + k] {
-                dist[node_base + k] = candidate;
-            }
-        }
+        relax_min_block(tree_backend, &mut dist, node_base, parent_base, width, edge);
     }
 
     let mut out = vec![0.0f64; samples.len() * width];
@@ -130,13 +420,11 @@ fn compute_target_block_simple(
             for entry in &samples[sample_i].entries {
                 let node = mapped_leaf_node_simple(tree, entry.leaf_ord, permutation);
                 let base = node * width;
-                let weight = entry.weight as f64;
-                for k in 0..width {
-                    row[k] += weight * dist[base + k] as f64;
-                }
+                dot_backend.accumulate(row, &dist[base..base + width], entry.weight as f64);
             }
         });
 
+    put_dist_scratch(dist);
     out
 }
 
@@ -176,7 +464,9 @@ fn compute_target_block_succ(
     width: usize,
 ) -> Vec<f64> {
     let node_count = tree.node_count();
-    let mut dist = vec![INF; node_count * width];
+    let dot_backend = SimdBackend::detect_dot(width);
+    let tree_backend = SimdBackend::detect_tree(width);
+    let mut dist = take_dist_scratch(node_count * width);
 
     for k in 0..width {
         let target = &samples[start + k];
@@ -186,8 +476,8 @@ fn compute_target_block_succ(
         }
     }
 
-    succ_bottom_up(tree, &mut dist, width);
-    succ_top_down(tree, &mut dist, width);
+    succ_bottom_up(tree, &mut dist, width, tree_backend);
+    succ_top_down(tree, &mut dist, width, tree_backend);
 
     let mut out = vec![0.0f64; samples.len() * width];
     out.par_chunks_mut(width)
@@ -196,17 +486,37 @@ fn compute_target_block_succ(
             for entry in &samples[sample_i].entries {
                 let node = mapped_leaf_node_succ(tree, entry.leaf_ord, permutation);
                 let base = node * width;
-                let weight = entry.weight as f64;
-                for k in 0..width {
-                    row[k] += weight * dist[base + k] as f64;
-                }
+                dot_backend.accumulate(row, &dist[base..base + width], entry.weight as f64);
             }
         });
 
+    put_dist_scratch(dist);
     out
 }
 
-fn succ_bottom_up(tree: &SuccPhyloTree, dist: &mut [f32], width: usize) {
+fn take_dist_scratch(len: usize) -> Vec<f32> {
+    let mut dist = DIST_SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        std::mem::take(&mut *scratch)
+    });
+    if dist.len() != len {
+        dist.resize(len, INF);
+    }
+    dist.fill(INF);
+    dist
+}
+
+fn put_dist_scratch(mut dist: Vec<f32>) {
+    dist.clear();
+    DIST_SCRATCH.with(|scratch| {
+        let mut slot = scratch.borrow_mut();
+        if dist.capacity() > slot.capacity() {
+            *slot = dist;
+        }
+    });
+}
+
+fn succ_bottom_up(tree: &SuccPhyloTree, dist: &mut [f32], width: usize, backend: SimdBackend) {
     enum Frame<N> {
         Enter { node: N, parent: Option<usize> },
         Exit { node: usize, parent: Option<usize> },
@@ -238,18 +548,13 @@ fn succ_bottom_up(tree: &SuccPhyloTree, dist: &mut [f32], width: usize) {
                 let edge = tree.branch_length[node];
                 let child_base = node * width;
                 let parent_base = parent * width;
-                for k in 0..width {
-                    let candidate = dist[child_base + k] + edge;
-                    if candidate < dist[parent_base + k] {
-                        dist[parent_base + k] = candidate;
-                    }
-                }
+                relax_min_block(backend, dist, parent_base, child_base, width, edge);
             }
         }
     }
 }
 
-fn succ_top_down(tree: &SuccPhyloTree, dist: &mut [f32], width: usize) {
+fn succ_top_down(tree: &SuccPhyloTree, dist: &mut [f32], width: usize, backend: SimdBackend) {
     let mut stack = vec![tree.bp.root()];
     while let Some(node) = stack.pop() {
         let parent_id = node.id() as usize;
@@ -258,12 +563,7 @@ fn succ_top_down(tree: &SuccPhyloTree, dist: &mut [f32], width: usize) {
             let child_id = edge_node.id() as usize;
             let edge = tree.branch_length[child_id];
             let child_base = child_id * width;
-            for k in 0..width {
-                let candidate = dist[parent_base + k] + edge;
-                if candidate < dist[child_base + k] {
-                    dist[child_base + k] = candidate;
-                }
-            }
+            relax_min_block(backend, dist, child_base, parent_base, width, edge);
             stack.push(edge_node);
         }
     }
@@ -371,6 +671,7 @@ fn write_f64<W: Write>(out: &mut W, buf: &mut ryu::Buffer, v: f64) -> Result<()>
 
 #[cfg(test)]
 mod tests {
+    use super::{SimdBackend, accumulate_weighted_dist_scalar, relax_min_scalar};
     use crate::table::{Sample, SampleEntry};
 
     #[test]
@@ -401,5 +702,31 @@ mod tests {
         };
         let copied = entry;
         assert_eq!(copied.leaf_ord, 1);
+    }
+
+    #[test]
+    fn simd_accumulator_matches_scalar() {
+        let dist = vec![0.0, 1.25, 2.5, 3.75, 5.0, 6.25, 7.5, 8.75, 10.0];
+        let mut scalar = vec![0.5f64; dist.len()];
+        let mut selected = scalar.clone();
+
+        accumulate_weighted_dist_scalar(&mut scalar, &dist, 0.125);
+        SimdBackend::detect_dot(dist.len()).accumulate(&mut selected, &dist, 0.125);
+
+        for (a, b) in scalar.iter().zip(selected.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn simd_relax_min_matches_scalar() {
+        let src = vec![0.0, 4.0, 1.5, f32::INFINITY, 3.25, 9.0, 0.125, 2.0, 5.5];
+        let mut scalar = vec![10.0, 1.0, 8.0, 2.0, 7.0, 8.5, 0.25, 8.0, 4.0];
+        let mut selected = scalar.clone();
+
+        relax_min_scalar(&mut scalar, &src, 0.5);
+        SimdBackend::detect_tree(src.len()).relax_min(&mut selected, &src, 0.5);
+
+        assert_eq!(scalar, selected);
     }
 }
