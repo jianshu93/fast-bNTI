@@ -1,0 +1,30 @@
+[package]
+name = "betanti"
+version = "0.1.0"
+edition = "2024"
+authors = ["jianshuzhao@yahoo.com"]
+description = "Exact fast betaMNTD and betaNTI from BIOM/TSV tables and Newick trees"
+license = "MIT OR Apache-2.0"
+keywords = ["microbiome", "phylogenetic", "betaMNTD", "betaNTI"]
+
+[[bin]]
+name = "betanti"
+path = "src/main.rs"
+
+[[bin]]
+name = "rc_bray"
+path = "src/bin/rc_bray.rs"
+
+[dependencies]
+anyhow = "1"
+clap = "4.5"
+env_logger = "0.11"
+log = "0.4"
+rayon = "1.10"
+num_cpus = "1"
+newick = "0.11.0"
+succparen = "0.0.3"
+hdf5 = { package = "hdf5-metno", version = "0.10", features = ["static", "zlib"] }
+rand = "0.8"
+rand_distr = "0.4"
+ryu = "1.0"
