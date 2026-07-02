@@ -11,6 +11,9 @@ The fast path is a batched tree distance transform: for each target-sample block
 ## Build
 
 ```bash
+### install rustup first: https://rustup.rs
+git clone https://github.com/jianshu93/fast-bNTI
+cd fast-bNTI
 cargo build --release
 ```
 
