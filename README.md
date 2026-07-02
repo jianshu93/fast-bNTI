@@ -23,8 +23,7 @@ cargo build --release
 betanti \
   --tree tree.nwk \
   --biom table.biom \
-  --permutations 999 \
-  --threads 16 \
+  --permutations 99 \
   --output betanti.tsv
 ```
 
@@ -59,8 +58,7 @@ Use `--matrix-output` to additionally write a square betaNTI matrix.
 ```bash
 rc_bray \
   --input table.tsv \
-  --permutations 1000 \
-  --threads 16 \
+  --permutations 99 \
   --output rc_bray.tsv
 ```
 
@@ -74,3 +72,6 @@ The implementation avoids dense randomized community matrices and the full 3D ar
 
 
 ## References
+Stegen, J.C., Lin, X., Fredrickson, J.K., Chen, X., Kennedy, D.W., Murray, C.J., Rockhold, M.L. and Konopka, A., 2013. Quantifying community assembly processes and identifying features that impose them. The ISME journal, 7(11), pp.2069-2079.
+
+Dini-Andreote, F., Stegen, J.C., Van Elsas, J.D. and Salles, J.F., 2015. Disentangling mechanisms that mediate the balance between stochastic and deterministic processes in microbial succession. Proceedings of the National Academy of Sciences, 112(11), pp.E1326-E1332.
